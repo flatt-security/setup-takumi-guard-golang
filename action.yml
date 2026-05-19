@@ -1,0 +1,192 @@
+name: 'Setup Takumi Guard Go Module Registry'
+description: 'Authenticate to the Takumi byGMO Guard Go module registry via OIDC. Works with the go toolchain.'
+author: 'GMO Flatt Security Inc.'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  bot-id:
+    description: 'Bot ID from Shisho Cloud byGMO console. Omit for anonymous mode (Tier A blocking only).'
+    required: false
+    default: ''
+  sts-url:
+    description: 'STS service URL'
+    required: false
+    default: 'https://sts.cloud.shisho.dev'
+  registry-url:
+    description: 'Go module registry URL (must speak the GOPROXY protocol)'
+    required: false
+    default: 'https://golang.flatt.tech'
+  expires-in:
+    description: 'Token expiration in seconds (max 86400)'
+    required: false
+    default: '1800'
+  set-goproxy:
+    description: 'Configure the GOPROXY environment variable. Set to false if you manage GOPROXY yourself.'
+    required: false
+    default: 'true'
+
+outputs:
+  token-expires-at:
+    description: 'ISO 8601 timestamp when the token expires'
+    value: ${{ steps.set-outputs.outputs.token-expires-at }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Authenticate and configure GOPROXY
+      id: auth
+      shell: bash
+      env:
+        BOT_ID: ${{ inputs.bot-id }}
+        STS_URL: ${{ inputs.sts-url }}
+        REGISTRY_URL: ${{ inputs.registry-url }}
+        EXPIRES_IN: ${{ inputs.expires-in }}
+        SET_GOPROXY: ${{ inputs.set-goproxy }}
+      run: |
+        REGISTRY_URL_NORMALIZED=$(echo "$REGISTRY_URL" | sed 's|/$||')
+        REGISTRY_HOST=$(echo "$REGISTRY_URL_NORMALIZED" | sed 's|^https://||')
+
+        write_goproxy() {
+          if [ "$SET_GOPROXY" != "false" ]; then
+            # GOPROXY has no "direct" fallback: a 404/410 from a chain entry
+            # tells the go client to try the next one, which for "direct"
+            # means resolving the module straight from VCS and bypassing the
+            # blocklist. Private modules belong in GOPRIVATE; the action
+            # does not touch GOPRIVATE.
+            echo "GOPROXY=${REGISTRY_URL_NORMALIZED}" >> "$GITHUB_ENV"
+            echo "::notice::GOPROXY set to ${REGISTRY_URL_NORMALIZED}"
+          fi
+        }
+
+        # bot-id was supplied → never silently downgrade to anonymous.
+        # Silent fallback under bot-id used to hide real auth failures
+        # behind 403s and rate-limit errors that look unrelated.
+        fail_with() {
+          echo "::error::$1"
+          exit 1
+        }
+
+        # Always clean up curl response bodies, even on early-exit paths.
+        # `rm -f ""` is a silent no-op so this is safe before assignment.
+        OIDC_BODY=""
+        STS_BODY=""
+        trap 'rm -f "${OIDC_BODY:-}" "${STS_BODY:-}"' EXIT
+
+        if [ -z "$BOT_ID" ]; then
+          echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
+          write_goproxy
+          exit 0
+        fi
+
+        if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ] || [ -z "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+          fail_with "OIDC not available. Add 'permissions: { id-token: write }' to your job."
+        fi
+
+        # --- OIDC token fetch ---
+        OIDC_BODY=$(mktemp)
+        OIDC_CURL_EXIT=0
+        OIDC_CODE=$(curl -sS -o "$OIDC_BODY" -w '%{http_code}' \
+          --max-time 15 --connect-timeout 5 \
+          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${REGISTRY_HOST}") || OIDC_CURL_EXIT=$?
+
+        if [ "$OIDC_CURL_EXIT" -ne 0 ]; then
+          fail_with "GitHub OIDC token fetch failed: curl exit ${OIDC_CURL_EXIT} (network/timeout to token.actions.githubusercontent.com)."
+        fi
+        if [ "$OIDC_CODE" != "200" ]; then
+          echo "::error::GitHub OIDC token endpoint returned HTTP ${OIDC_CODE}."
+          head -c 500 "$OIDC_BODY" | sed 's/^/::error::oidc body: /' || true
+          exit 1
+        fi
+
+        # jq 1.6 exits 4 and jq 1.7 exits 5 on non-JSON input. Both die
+        # under `set -e -o pipefail` if not caught. Validate first.
+        if ! jq -e . "$OIDC_BODY" >/dev/null 2>&1; then
+          echo "::error::GitHub OIDC token endpoint returned non-JSON (HTTP ${OIDC_CODE})."
+          head -c 500 "$OIDC_BODY" | sed 's/^/::error::oidc body: /' || true
+          exit 1
+        fi
+        OIDC_TOKEN=$(jq -r '.value // empty' "$OIDC_BODY")
+        rm -f "$OIDC_BODY"
+
+        if [ -z "$OIDC_TOKEN" ]; then
+          fail_with "GitHub OIDC token response missing 'value' field."
+        fi
+        echo "::add-mask::${OIDC_TOKEN}"
+
+        # --- STS exchange ---
+        STS_BODY=$(mktemp)
+        STS_CURL_EXIT=0
+        STS_CODE=$(curl -sS -o "$STS_BODY" -w '%{http_code}' \
+          --max-time 15 --connect-timeout 5 \
+          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+          -X POST "${STS_URL}/bots/exchange" \
+          -H "Content-Type: application/json" \
+          -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}") || STS_CURL_EXIT=$?
+
+        if [ "$STS_CURL_EXIT" -ne 0 ]; then
+          fail_with "STS exchange failed: curl exit ${STS_CURL_EXIT} (network/timeout reaching ${STS_URL})."
+        fi
+
+        # Non-JSON STS responses (e.g. an HTML error page from an upstream
+        # layer or plaintext from a gateway) caused a silent exit-4/exit-5
+        # under the previous unguarded `jq -r '.access_token'` pipe.
+        if ! jq -e . "$STS_BODY" >/dev/null 2>&1; then
+          echo "::error::STS returned non-JSON (HTTP ${STS_CODE}). Usually indicates an outage upstream of STS."
+          head -c 500 "$STS_BODY" | sed 's/^/::error::sts body: /' || true
+          exit 1
+        fi
+
+        ACCESS_TOKEN=$(jq -r '.access_token // empty' "$STS_BODY")
+        EXPIRES_IN_ACTUAL=$(jq -r '.expires_in // 1800' "$STS_BODY")
+        STS_ERROR=$(jq -r '.message // .error // empty' "$STS_BODY")
+        rm -f "$STS_BODY"
+
+        if [ -z "$ACCESS_TOKEN" ]; then
+          if [ "$STS_CODE" = "401" ] || [ "$STS_CODE" = "403" ]; then
+            fail_with "STS rejected bot-id (HTTP ${STS_CODE}): ${STS_ERROR:-no message}. Check that bot-id is valid and the workflow's OIDC subject is allowed."
+          fi
+          fail_with "STS returned HTTP ${STS_CODE} without an access_token: ${STS_ERROR:-no message}."
+        fi
+        echo "::add-mask::${ACCESS_TOKEN}"
+
+        # Write .netrc — the Go toolchain (cmd/go/internal/web) reads
+        # $HOME/.netrc for HTTP Basic auth. The username field is conventional
+        # and ignored by Guard's auth middleware, which decodes the JWT in the
+        # password field. Preserves any existing entries for other hosts.
+        NETRC="$HOME/.netrc"
+        if [ -f "$NETRC" ]; then
+          awk -v host="$REGISTRY_HOST" '
+            /^[[:space:]]*machine[[:space:]]+/ { skip = ($2 == host) ? 1 : 0 }
+            /^[[:space:]]*default([[:space:]]|$)/ { skip = 0 }
+            { if (!skip) print }
+          ' "$NETRC" > "${NETRC}.tmp" && mv "${NETRC}.tmp" "$NETRC"
+        fi
+        printf 'machine %s login _ password %s\n' "$REGISTRY_HOST" "$ACCESS_TOKEN" >> "$NETRC"
+        chmod 600 "$NETRC"
+
+        # GOPROXY write is atomic with the successful-auth decision —
+        # never set GOPROXY when auth fails partway through.
+        write_goproxy
+
+        EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                     || date -u -v+"${EXPIRES_IN_ACTUAL}"S +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+                     || echo "")
+        if [ -n "$EXPIRES_AT" ]; then
+          echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+        fi
+        echo "::notice::Authenticated as bot ${BOT_ID} (Tier C)"
+
+    - name: Set outputs
+      id: set-outputs
+      shell: bash
+      env:
+        EXPIRES_AT: ${{ steps.auth.outputs.expires_at }}
+      run: |
+        if [ -n "$EXPIRES_AT" ]; then
+          echo "token-expires-at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+        fi

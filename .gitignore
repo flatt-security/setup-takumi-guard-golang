@@ -1,0 +1,6 @@
+node_modules/
+.netrc
+*.log
+.DS_Store
+*.pem
+*.pub

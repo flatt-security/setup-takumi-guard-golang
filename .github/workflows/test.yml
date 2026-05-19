@@ -1,0 +1,51 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate action.yml
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('action.yml'))"
+          echo "action.yml is valid YAML"
+
+      - name: Check required fields
+        run: |
+          grep -q 'using:.*composite' action.yml
+          grep -q "bot-id:" action.yml
+          grep -q "set-goproxy:" action.yml
+          grep -q "golang.flatt.tech" action.yml
+          echo "Required fields present"
+
+  integration-anonymous:
+    # Smoke-tests anonymous mode against the live registry. End-to-end
+    # validation across modes lives in flatt-security/takumi-guard-golang-test;
+    # this job is kept as a self-contained sanity check inside the action repo.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false  # GOPROXY isn't set yet at module-cache pre-warm time
+
+      - uses: ./
+
+      - name: Verify GOPROXY is set with no ,direct fallback
+        run: |
+          test "$GOPROXY" = "https://golang.flatt.tech" \
+            || (echo "GOPROXY is '$GOPROXY' but expected 'https://golang.flatt.tech' (no fallback)"; exit 1)
+          echo "GOPROXY=$GOPROXY"
+
+      - name: Fetch a real module through the proxy
+        run: |
+          mkdir -p /tmp/probe && cd /tmp/probe
+          go mod init probe
+          go get github.com/stretchr/testify@v1.10.0
