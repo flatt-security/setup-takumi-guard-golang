@@ -15,6 +15,10 @@ inputs:
     description: 'STS service URL'
     required: false
     default: 'https://sts.cloud.shisho.dev'
+  audience:
+    description: 'Audience for the OIDC token request. Defaults to the STS URL. Override when your Bot trust condition expects a different value.'
+    required: false
+    default: ''
   registry-url:
     description: 'Go module registry URL (must speak the GOPROXY protocol)'
     required: false
@@ -42,6 +46,7 @@ runs:
       env:
         BOT_ID: ${{ inputs.bot-id }}
         STS_URL: ${{ inputs.sts-url }}
+        AUDIENCE_INPUT: ${{ inputs.audience }}
         REGISTRY_URL: ${{ inputs.registry-url }}
         EXPIRES_IN: ${{ inputs.expires-in }}
         SET_GOPROXY: ${{ inputs.set-goproxy }}
@@ -86,13 +91,26 @@ runs:
         fi
 
         # --- OIDC token fetch ---
+        # Resolve the OIDC audience: an explicit input wins; otherwise default
+        # to the STS URL. The audience names the verifier of the token, which
+        # is the STS regardless of registry; it is also the console's default
+        # audience for trust conditions. Normalized without a trailing slash
+        # because STS matches it as an exact string.
+        STS_URL_NORMALIZED=$(echo "$STS_URL" | sed 's|/$||')
+        if [ -n "$AUDIENCE_INPUT" ]; then
+          OIDC_AUDIENCE="$AUDIENCE_INPUT"
+        else
+          OIDC_AUDIENCE="$STS_URL_NORMALIZED"
+        fi
+
         OIDC_BODY=$(mktemp)
         OIDC_CURL_EXIT=0
         OIDC_CODE=$(curl -sS -o "$OIDC_BODY" -w '%{http_code}' \
           --max-time 15 --connect-timeout 5 \
           --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
           -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${REGISTRY_HOST}") || OIDC_CURL_EXIT=$?
+          -G --data-urlencode "audience=${OIDC_AUDIENCE}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}") || OIDC_CURL_EXIT=$?
 
         if [ "$OIDC_CURL_EXIT" -ne 0 ]; then
           fail_with "GitHub OIDC token fetch failed: curl exit ${OIDC_CURL_EXIT} (network/timeout to token.actions.githubusercontent.com)."
