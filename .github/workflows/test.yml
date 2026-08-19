@@ -24,6 +24,18 @@ jobs:
           grep -q "golang.flatt.tech" action.yml
           echo "Required fields present"
 
+  retry:
+    # Exercises curl_with_retry against local mocks for both the OIDC and the
+    # STS endpoint, so the job needs neither id-token permission nor egress.
+    # Assertions count retry attempts, not elapsed time — the pre-change
+    # implementation also burns tens of seconds before failing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retry behaviour
+        run: bash test/retry_test.sh
+
   integration-anonymous:
     # Smoke-tests anonymous mode against the live registry. End-to-end
     # validation across modes lives in flatt-security/takumi-guard-golang-test;

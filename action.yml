@@ -74,6 +74,40 @@ runs:
           exit 1
         }
 
+        # curl_with_retry <outfile> <curl args...>
+        # Prints the HTTP status code on stdout and returns curl's exit code.
+        # Network errors, 429 and 5xx are retried up to 5 times with
+        # exponential backoff plus jitter. 4xx other than 429 is not retried:
+        # a permanent rejection gains nothing from retrying, and retrying it
+        # blurs "unreachable" into "refused" in the failure message.
+        # Each attempt starts a fresh curl process, so DNS is re-resolved every
+        # time — curl's in-process resolver cache would otherwise pin a failing
+        # address for the whole retry sequence.
+        curl_with_retry() {
+          local outfile=$1; shift
+          local code=0 curl_exit=0 attempt delay
+          for attempt in 1 2 3 4 5; do
+            curl_exit=0
+            code=$(curl -sS -o "$outfile" -w '%{http_code}' \
+              --connect-timeout 10 --max-time 25 "$@") || curl_exit=$?
+            if [ "$curl_exit" -eq 0 ]; then
+              case "$code" in
+                429|5??) : ;;
+                *) printf '%s' "$code"; return 0 ;;
+              esac
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              # Jitter spreads the retry across jobs that were interrupted by
+              # the same upstream blip; a fixed delay makes them collide again.
+              delay=$(( (1 << attempt) + RANDOM % 4 ))
+              echo "::warning::attempt ${attempt}/5 failed (curl exit ${curl_exit}, HTTP ${code:-n/a}); retrying in ${delay}s" >&2
+              sleep "$delay"
+            fi
+          done
+          printf '%s' "$code"
+          return "$curl_exit"
+        }
+
         # Always clean up curl response bodies, even on early-exit paths.
         # `rm -f ""` is a silent no-op so this is safe before assignment.
         OIDC_BODY=""
@@ -105,9 +139,7 @@ runs:
 
         OIDC_BODY=$(mktemp)
         OIDC_CURL_EXIT=0
-        OIDC_CODE=$(curl -sS -o "$OIDC_BODY" -w '%{http_code}' \
-          --max-time 15 --connect-timeout 5 \
-          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+        OIDC_CODE=$(curl_with_retry "$OIDC_BODY" \
           -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
           -G --data-urlencode "audience=${OIDC_AUDIENCE}" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}") || OIDC_CURL_EXIT=$?
@@ -139,9 +171,7 @@ runs:
         # --- STS exchange ---
         STS_BODY=$(mktemp)
         STS_CURL_EXIT=0
-        STS_CODE=$(curl -sS -o "$STS_BODY" -w '%{http_code}' \
-          --max-time 15 --connect-timeout 5 \
-          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+        STS_CODE=$(curl_with_retry "$STS_BODY" \
           -X POST "${STS_URL}/bots/exchange" \
           -H "Content-Type: application/json" \
           -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}") || STS_CURL_EXIT=$?
