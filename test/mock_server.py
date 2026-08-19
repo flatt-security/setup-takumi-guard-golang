@@ -6,8 +6,11 @@ Two roles:
   --codes 503,200   STS exchange: return each status once, in order, then
                     repeat the last one forever
 
-`/__ready` is answered without advancing the script so the test harness can
-poll for startup without consuming a scripted response.
+`/__ready` and `/__count` are answered without advancing the script, so the
+harness can poll for startup and read the number of scripted requests served
+without consuming one. The count is what lets a test assert that a retry
+actually reached the server: an implementation that only printed the expected
+warnings would pass every other assertion.
 """
 
 import argparse
@@ -39,7 +42,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/__ready"):
             self._respond(200, b"{}")
             return
+        if self.path.startswith("/__count"):
+            self._respond(200, ('{"served":%d}' % served[0]).encode())
+            return
         if args.oidc:
+            served[0] += 1
             self._respond(200, OIDC_BODY)
             return
         index = min(served[0], len(codes) - 1)

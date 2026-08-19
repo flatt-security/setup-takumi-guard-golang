@@ -76,10 +76,16 @@ runs:
 
         # curl_with_retry <outfile> <curl args...>
         # Prints the HTTP status code on stdout and returns curl's exit code.
-        # Network errors, 429 and 5xx are retried up to 5 times with
-        # exponential backoff plus jitter. 4xx other than 429 is not retried:
-        # a permanent rejection gains nothing from retrying, and retrying it
+        # Network errors, 408, 429 and 5xx are retried up to 5 times with
+        # exponential backoff plus jitter. Other 4xx is not retried: a
+        # permanent rejection gains nothing from retrying, and retrying it
         # blurs "unreachable" into "refused" in the failure message.
+        # 408 and 429 are the set curl's own --retry treated as transient, kept
+        # so this helper is not a narrowing of what it replaces. A Retry-After
+        # header is deliberately ignored: honouring a server-chosen delay would
+        # let one header stretch the step past its budget, and the endpoints
+        # here are ours and GitHub's, neither of which rate-limits this call in
+        # normal operation.
         # Each attempt starts a fresh curl process, so DNS is re-resolved every
         # time — curl's in-process resolver cache would otherwise pin a failing
         # address for the whole retry sequence.
@@ -92,7 +98,7 @@ runs:
               --connect-timeout 10 --max-time 25 "$@") || curl_exit=$?
             if [ "$curl_exit" -eq 0 ]; then
               case "$code" in
-                429|5??) : ;;
+                408|429|5??) : ;;
                 *) printf '%s' "$code"; return 0 ;;
               esac
             fi
