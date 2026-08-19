@@ -207,17 +207,19 @@ Go does not embed the registry URL into `go.mod` or `go.sum`. Most projects can 
 
 ### Network retries
 
-Both network calls the action makes -- the GitHub OIDC token fetch and the Shisho Cloud STS exchange -- are retried up to 5 times. Each attempt is a fresh request, so DNS is resolved again every time; runners occasionally end up unable to reach one address while the service is serving everyone else normally, and reusing the first resolution would make every retry fail the same way.
+Both network calls the action makes -- the GitHub OIDC token fetch and the Shisho Cloud STS exchange -- are retried up to 5 times, so a transient network condition on the runner does not fail your build.
 
-Backoff is 2, 4, 8 and 16 seconds plus up to 3 seconds of jitter, so jobs interrupted by the same blip do not all retry in lockstep. Retries cover network failures, HTTP 408, 429 and 5xx; any other 4xx fails immediately, because a rejected request will be rejected again.
+Each attempt is a fresh request, so DNS is resolved again every time rather than reusing whatever the first attempt happened to resolve. That makes every retry an independent attempt: for a multi-homed endpoint, a later attempt can take a different path.
 
-Each retried attempt logs a warning, so a job that recovered from a blip still shows it:
+Backoff is 2, 4, 8 and 16 seconds plus up to 3 seconds of jitter, so concurrent jobs do not retry in lockstep. Retries cover network failures, HTTP 408, 429 and 5xx; any other 4xx fails immediately, because a rejected request will be rejected again.
+
+Each retried attempt logs a warning, so a job that retried and then succeeded still shows what happened:
 
 ```
 ::warning::attempt 1/5 failed (curl exit 28, HTTP 000); retrying in 3s
 ```
 
-**This means a hard failure is not immediate.** A call that cannot connect at all takes about 80-90 seconds to give up, and one that hangs until the per-attempt timeout takes up to about 165 seconds. In the worst case -- both calls hanging -- the step runs for roughly 5 minutes before failing. That is deliberate: most observed blips clear well inside that window, and a job that waits and succeeds beats one that fails fast and has to be re-run by hand.
+**This means a hard failure is not immediate.** A call that cannot connect at all takes about 80-92 seconds to give up, and one that hangs until the per-attempt timeout takes up to about 167 seconds. In the worst case -- both calls hanging -- the step runs for roughly 5 minutes before failing. That is deliberate: a transient condition almost always clears well inside that window, and a job that waits and succeeds beats one that fails fast and has to be re-run by hand.
 
 ---
 
