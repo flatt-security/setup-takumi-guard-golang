@@ -175,6 +175,16 @@ runs:
         echo "::add-mask::${OIDC_TOKEN}"
 
         # --- STS exchange ---
+        # The ID token is fetched once, above, and reused across every STS
+        # retry. GitHub issues it with a 300 second lifetime (measured: exp -
+        # iat = 300, nbf = iat - 300), and the clock only starts once the OIDC
+        # fetch has succeeded, so retries there cost nothing here. The worst
+        # case below is 5 x --max-time 25 plus 30-42s of backoff, about 167s,
+        # which leaves roughly 130s of the token's validity unused. Raising the
+        # attempt count or --max-time eats into that margin: past ~300s the
+        # last attempt would present an expired token and STS would reject it
+        # as invalid, which reads like a trust-condition problem rather than a
+        # timeout.
         STS_BODY=$(mktemp)
         STS_CURL_EXIT=0
         STS_CODE=$(curl_with_retry "$STS_BODY" \

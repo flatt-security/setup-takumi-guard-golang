@@ -40,33 +40,6 @@ jobs:
       - name: Retry behaviour
         run: bash test/retry_test.sh
 
-  oidc-token-lifetime:
-    # TEMPORARY probe, removed before review. Measures the validity window of
-    # the GitHub OIDC ID token so the STS retry budget can be checked against
-    # it. Only the numeric claims are printed; the token itself is not.
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - name: Measure OIDC token lifetime
-        run: |
-          BODY=$(mktemp)
-          curl -sS -o "$BODY" \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            -G --data-urlencode "audience=https://sts.cloud.shisho.dev" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}"
-          python3 - "$BODY" <<'EOF'
-          import base64, json, sys
-          tok = json.load(open(sys.argv[1]))["value"]
-          part = tok.split(".")[1]
-          part += "=" * (-len(part) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(part))
-          print("iat      =", claims["iat"])
-          print("nbf      =", claims.get("nbf"))
-          print("exp      =", claims["exp"])
-          print("lifetime =", claims["exp"] - claims["iat"], "seconds")
-          EOF
-
   integration-anonymous:
     # Smoke-tests anonymous mode against the live registry. End-to-end
     # validation across modes lives in flatt-security/takumi-guard-golang-test;
