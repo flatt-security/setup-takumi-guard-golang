@@ -197,13 +197,29 @@ Go does not embed the registry URL into `go.mod` or `go.sum`. Most projects can 
 | `OIDC not available` | Missing permission on the job | Add `permissions: { id-token: write }` to your job |
 | `STS returned non-JSON (HTTP N)` | An error response from STS or an upstream layer was not valid JSON (e.g. an HTML error page from a transient outage) | Usually a transient infrastructure issue. The HTTP status and a body snippet are echoed to the log to help diagnose. |
 | `STS returned HTTP N without an access_token` | STS rejected the auth request | The job log includes STS's own message inside this error. Common cases: `invalid ID token` -- trust condition mismatch, check the bot's trust settings in Shisho Cloud byGMO (if the trust condition sets an audience, it must equal the value the action sends -- by default the STS URL, overridable via the `audience` input); `invalid request` -- malformed bot-id, double-check the value from your console. |
-| `GitHub OIDC token fetch failed` | Could not reach `token.actions.githubusercontent.com` or got a non-200 response | Usually transient; the action retries up to 3 times. Persistent failures point at a GitHub Actions issue. |
+| `GitHub OIDC token fetch failed` | Could not reach `token.actions.githubusercontent.com` or got a non-200 response | Usually transient; the action retries up to 5 times (see *Network retries* below). Persistent failures point at a GitHub Actions issue. |
 | `go: module ...: 403 Forbidden` | Module or version is blocked by the proxy | Expected — this is the proxy doing its job. Check the dashboard for the block reason. |
 | `go: module ...: reading ...: dial tcp: lookup ...` after enabling | `GOPRIVATE` mismatch — proxy is being asked for a private module | Add the host to `GOPRIVATE` (e.g. `GOPRIVATE=github.com/myorg/*`) |
 | Build silently uses unblocked module | `GOPROXY` includes a `direct` fallback (`|direct` or `,direct`) — either lets blocked or unindexed modules resolve straight from VCS | Set `GOPROXY=https://golang.flatt.tech` with no fallback. Use `GOPRIVATE` for any private modules. |
 | `go: module ...: 404 Not Found` | Module isn't carried by `proxy.golang.org`; the proxy has nothing to serve | If the module is private, add it to `GOPRIVATE` (e.g. `GOPRIVATE=github.com/myorg/*`). If it should be public, file an issue. |
 
 > **Still stuck?** Open an issue on this repository with your error output and workflow file (redact any IDs).
+
+### Network retries
+
+Both network calls the action makes -- the GitHub OIDC token fetch and the Shisho Cloud STS exchange -- are retried up to 5 times, so a transient network condition on the runner does not fail your build.
+
+Each attempt is a fresh request, so DNS is resolved again every time rather than reusing whatever the first attempt happened to resolve. That makes every retry an independent attempt: for a multi-homed endpoint, a later attempt can take a different path.
+
+Backoff is 2, 4, 8 and 16 seconds plus up to 3 seconds of jitter, so concurrent jobs do not retry in lockstep. Retries cover network failures, HTTP 408, 429 and 5xx; any other 4xx fails immediately, because a rejected request will be rejected again.
+
+Each retried attempt logs a warning, so a job that retried and then succeeded still shows what happened:
+
+```
+::warning::attempt 1/5 failed (curl exit 28, HTTP 000); retrying in 3s
+```
+
+**This means a hard failure is not immediate.** A call that cannot connect at all takes about 80-92 seconds to give up, and one that hangs until the per-attempt timeout takes up to about 167 seconds. In the worst case -- both calls hanging -- the step runs for roughly 5 minutes before failing. That is deliberate: a transient condition almost always clears well inside that window, and a job that waits and succeeds beats one that fails fast and has to be re-run by hand.
 
 ---
 

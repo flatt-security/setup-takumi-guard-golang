@@ -74,6 +74,56 @@ runs:
           exit 1
         }
 
+        # curl_with_retry <outfile> <curl args...>
+        # Prints the HTTP status code on stdout and returns curl's exit code.
+        #
+        # Runners are ephemeral and the network path between one and any given
+        # endpoint is outside anyone's control, so a single request can fail
+        # for reasons unrelated to the endpoint's health. Absorbing that is
+        # what keeps the action's success rate high, and it is worth spending
+        # a generous window on: a job that waits and succeeds beats one that
+        # fails fast and has to be re-run by hand.
+        #
+        # Network errors, 408, 429 and 5xx are retried up to 5 times with
+        # exponential backoff plus jitter. Other 4xx is not retried: a
+        # permanent rejection gains nothing from retrying, and retrying it
+        # blurs "unreachable" into "refused" in the failure message.
+        # 408 and 429 are the set curl's own --retry treated as transient, kept
+        # so this helper is not a narrowing of what it replaces. A Retry-After
+        # header is deliberately ignored: honouring a server-chosen delay would
+        # let one header stretch the step past its budget.
+        #
+        # Each attempt starts a fresh curl process, so DNS is resolved again
+        # every time. curl's built-in --retry reuses one process and with it
+        # one resolver cache, which makes every attempt reuse the address the
+        # first one picked; a fresh process lets a later attempt reach a
+        # multi-homed endpoint by a different path. That is what makes these
+        # retries independent attempts rather than repeats of the same request.
+        curl_with_retry() {
+          local outfile=$1; shift
+          local code=0 curl_exit=0 attempt delay
+          for attempt in 1 2 3 4 5; do
+            curl_exit=0
+            code=$(curl -sS -o "$outfile" -w '%{http_code}' \
+              --connect-timeout 10 --max-time 25 "$@") || curl_exit=$?
+            if [ "$curl_exit" -eq 0 ]; then
+              case "$code" in
+                408|429|5??) : ;;
+                *) printf '%s' "$code"; return 0 ;;
+              esac
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              # Jitter keeps concurrent jobs from retrying in lockstep, which
+              # a fixed delay would turn into a synchronised burst.
+              delay=$(( (1 << attempt) + RANDOM % 4 ))
+              echo "::warning::attempt ${attempt}/5 failed (curl exit ${curl_exit}, HTTP ${code:-n/a}); retrying in ${delay}s" >&2
+              sleep "$delay"
+            fi
+          done
+          printf '%s' "$code"
+          return "$curl_exit"
+        }
+
         # Always clean up curl response bodies, even on early-exit paths.
         # `rm -f ""` is a silent no-op so this is safe before assignment.
         OIDC_BODY=""
@@ -105,9 +155,7 @@ runs:
 
         OIDC_BODY=$(mktemp)
         OIDC_CURL_EXIT=0
-        OIDC_CODE=$(curl -sS -o "$OIDC_BODY" -w '%{http_code}' \
-          --max-time 15 --connect-timeout 5 \
-          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+        OIDC_CODE=$(curl_with_retry "$OIDC_BODY" \
           -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
           -G --data-urlencode "audience=${OIDC_AUDIENCE}" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}") || OIDC_CURL_EXIT=$?
@@ -137,11 +185,19 @@ runs:
         echo "::add-mask::${OIDC_TOKEN}"
 
         # --- STS exchange ---
+        # The ID token is fetched once, above, and reused across every STS
+        # retry. GitHub issues it with a 300 second lifetime (measured: exp -
+        # iat = 300, nbf = iat - 300), and the clock only starts once the OIDC
+        # fetch has succeeded, so retries there cost nothing here. The worst
+        # case below is 5 x --max-time 25 plus 30-42s of backoff, about 167s,
+        # which leaves roughly 130s of the token's validity unused. Raising the
+        # attempt count or --max-time eats into that margin: past ~300s the
+        # last attempt would present an expired token and STS would reject it
+        # as invalid, which reads like a trust-condition problem rather than a
+        # timeout.
         STS_BODY=$(mktemp)
         STS_CURL_EXIT=0
-        STS_CODE=$(curl -sS -o "$STS_BODY" -w '%{http_code}' \
-          --max-time 15 --connect-timeout 5 \
-          --retry 3 --retry-delay 2 --retry-connrefused --retry-all-errors \
+        STS_CODE=$(curl_with_retry "$STS_BODY" \
           -X POST "${STS_URL}/bots/exchange" \
           -H "Content-Type: application/json" \
           -d "{\"bot_id\": \"${BOT_ID}\", \"id_token\": \"${OIDC_TOKEN}\", \"expires_in\": ${EXPIRES_IN}}") || STS_CURL_EXIT=$?
