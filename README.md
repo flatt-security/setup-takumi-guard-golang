@@ -186,7 +186,29 @@ Go does not embed the registry URL into `go.mod` or `go.sum`. Most projects can 
 
 | Output | Description |
 |---|---|
+| `token` | The access token for the registry. Only set when authenticated. |
 | `token-expires-at` | ISO 8601 timestamp of token expiration. Only set when authenticated. |
+
+The `token` output lets a step hand the token to a tool that does not read the runner's `$HOME/.netrc`, such as a Docker container that does not mount it. Pass it through `env:` and name the variable without its value, so the token does not appear on the command line:
+
+```yaml
+- uses: flatt-security/setup-takumi-guard-golang@v1
+  id: guard
+  with:
+    bot-id: 'BT01...'
+
+- name: Build in a container
+  env:
+    GUARD_TOKEN: ${{ steps.guard.outputs.token }}
+  run: |
+    docker run --rm -e GUARD_TOKEN -e GOPROXY=https://golang.flatt.tech \
+      -v "$PWD:/src" -w /src golang:1.24 \
+      sh -c 'printf "machine golang.flatt.tech login _ password %s\n" "$GUARD_TOKEN" > ~/.netrc && chmod 600 ~/.netrc && go build ./...'
+```
+
+If you set `registry-url`, use its host in both `GOPROXY` and the `.netrc` line.
+
+The token is a credential for your bot. Do not pass it with `docker build --build-arg` or write it into an image, because build arguments and image layers keep it after the job ends; use a BuildKit secret (`docker build --secret`) instead.
 
 ---
 
