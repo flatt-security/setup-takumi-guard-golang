@@ -40,6 +40,16 @@ jobs:
       - name: Retry behaviour
         run: bash test/retry_test.sh
 
+  outputs:
+    # Runs the auth and set-outputs steps against local mocks, so the job needs
+    # neither id-token permission nor egress.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Token output
+        run: bash test/outputs_test.sh
+
   integration-anonymous:
     # Smoke-tests anonymous mode against the live registry. End-to-end
     # validation across modes lives in flatt-security/takumi-guard-golang-test;
